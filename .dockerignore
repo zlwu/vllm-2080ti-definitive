@@ -1,0 +1,8 @@
+# Keep the build context tiny: the vLLM source tree is cloned inside the build.
+*
+!Dockerfile
+!entrypoint.sh
+!relax-flashqla-build-guard.py
+!README.md
+!LICENSE
+!.github/vllm-ref
