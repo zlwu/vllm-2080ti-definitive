@@ -35,7 +35,7 @@ on:
   schedule:
     # Check for new CUDA base images. A new upstream vLLM release opens a pull
     # request instead of building straight away.
-    - cron: '23 3 * * 1'
+    - cron: '23 0 * * *'
 
 permissions:
   contents: write
