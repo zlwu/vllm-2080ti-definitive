@@ -3,12 +3,22 @@ name: Image
 # The image is only rebuilt when something upstream actually moved:
 #
 #   * the pinned CUDA base image digests (devel = builder, base = runtime)
-#   * a new stable release of weicj/vLLM-2080Ti-Definitive
+#   * a new stable release of weicj/vLLM-2080Ti-Definitive on the same release
+#     line as the pinned one (v0.2.2 -> v0.2.2-post2): this builds directly and
+#     records the new ref in .github/vllm-ref afterwards
+#   * a new stable release on a different minor/major line (v0.2.x -> v0.3.0):
+#     this opens a pull request instead, because it is a runtime migration
 #   * a change to the build recipe in this repository
 #
 # There is deliberately no "rebuild on every push / every week" behaviour: a
-# full build compiles vLLM from source, so the weekly job is a *check* that only
-# escalates to a build when a base digest changed.
+# full build compiles vLLM from source, so the scheduled job is a *check* that
+# only escalates to a build when a base digest or the upstream ref moved.
+#
+# `.github/vllm-ref` is the recorded last-built upstream release, not a
+# hand-maintained gate: the workflow updates it after a successful push. Every
+# image also carries that ref as a tag (`v0.2.2-post2`) and as the label
+# `io.github.zlwu.upstream-ref`, so a running deployment can be traced back to
+# the upstream tag without reading the Actions log.
 
 on:
   push:
@@ -33,8 +43,8 @@ on:
         required: false
         default: '4'
   schedule:
-    # Check for new CUDA base images. A new upstream vLLM release opens a pull
-    # request instead of building straight away.
+    # Poll for new CUDA base images and upstream releases. A same-line release
+    # builds straight away; a different release line opens a pull request.
     - cron: '23 0 * * *'
 
 permissions:
@@ -86,6 +96,7 @@ jobs:
       cuda_runtime: ${{ steps.decide.outputs.cuda_runtime }}
       base_changed: ${{ steps.decide.outputs.base_changed }}
       vllm_ref: ${{ steps.decide.outputs.vllm_ref }}
+      bump: ${{ steps.upstream.outputs.bump }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -118,12 +129,30 @@ jobs:
             *) echo "Invalid upstream release tag: $latest_ref" >&2; exit 1 ;;
           esac
           echo "latest_ref=${latest_ref}" >> "$GITHUB_OUTPUT"
+
+          # auto   = same release line, built without a human in the loop
+          # review = different line, proposed as a pull request
+          # none   = the recorded ref is already the latest stable release
+          pinned_ref=$(tr -d '[:space:]' < .github/vllm-ref)
+          case "$pinned_ref" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Invalid recorded upstream ref: ${pinned_ref}" >&2; exit 1 ;;
+          esac
+          if [ "$latest_ref" = "$pinned_ref" ]; then
+            bump=none
+          elif [ "$(echo "$latest_ref" | cut -d. -f1-2)" = "$(echo "$pinned_ref" | cut -d. -f1-2)" ]; then
+            bump=auto
+          else
+            bump=review
+          fi
+          echo "bump=${bump}" >> "$GITHUB_OUTPUT"
+
           echo "Resolved CUDA devel digest:  ${devel_digest}"
           echo "Resolved CUDA runtime digest: ${runtime_digest}"
-          echo "Pinned vLLM release: $(tr -d '[:space:]' < .github/vllm-ref), latest: ${latest_ref}"
+          echo "Recorded vLLM release: ${pinned_ref}, latest: ${latest_ref}, action: ${bump}"
 
       - name: Propose upstream release bump
-        if: github.event_name == 'schedule' && steps.upstream.outputs.latest_ref != steps.upstream.outputs.pinned_ref
+        if: github.event_name == 'schedule' && steps.upstream.outputs.bump == 'review'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -161,6 +190,7 @@ jobs:
           PINNED_RUNTIME: ${{ steps.upstream.outputs.pinned_runtime }}
           PINNED_REF: ${{ steps.upstream.outputs.pinned_ref }}
           LATEST_REF: ${{ steps.upstream.outputs.latest_ref }}
+          BUMP: ${{ steps.upstream.outputs.bump }}
         run: |
           set -euo pipefail
           build=false
@@ -186,9 +216,19 @@ jobs:
               else
                 echo "CUDA bases unchanged"
               fi
-              if [ "$LATEST_REF" != "$PINNED_REF" ]; then
-                echo "upstream ${LATEST_REF} is not pinned yet; pull request opened, not building"
-              fi
+              case "$BUMP" in
+                none)
+                  echo "recorded ref is already the latest stable release (${LATEST_REF})"
+                  ;;
+                auto)
+                  echo "same release line: building ${LATEST_REF}"
+                  build=true
+                  vllm_ref="$LATEST_REF"
+                  ;;
+                review)
+                  echo "${LATEST_REF} changes the release line; pull request opened, not building"
+                  ;;
+              esac
               ;;
           esac
 
@@ -238,9 +278,11 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.detect.outputs.vllm_ref }}
             type=ref,event=tag
             type=sha,format=long
           labels: |
+            io.github.zlwu.upstream-ref=${{ needs.detect.outputs.vllm_ref }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Standalone vLLM 2080 Ti Definitive Edition (SM75) runtime
             org.opencontainers.image.licenses=Apache-2.0
@@ -268,6 +310,30 @@ jobs:
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: |
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max,oci-mediatypes=true,image-manifest=true
+
+      # `.github/vllm-ref` is the recorded last-built upstream release. Writing
+      # it after a successful push is what makes the scheduled check idempotent
+      # without a human bumping the pin. This push uses GITHUB_TOKEN, so it does
+      # not trigger another workflow run.
+      - name: Record the built upstream ref
+        if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          ref='${{ needs.detect.outputs.vllm_ref }}'
+          case "$ref" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "not a release tag (${ref}); leaving the marker alone"; exit 0 ;;
+          esac
+          if [ "$(tr -d '[:space:]' < .github/vllm-ref)" = "$ref" ]; then
+            echo ".github/vllm-ref already records ${ref}"
+            exit 0
+          fi
+          printf '%s\n' "$ref" > .github/vllm-ref
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/vllm-ref
+          git commit -m "Record built upstream ref ${ref}"
+          git push origin HEAD:main || echo 'push failed; the ref will be re-detected next run'
 
       # Record the base digests only after the image published, so a failed
       # build leaves the pins untouched and the next check retries them.

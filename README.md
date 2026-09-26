@@ -42,16 +42,31 @@ image roughly in half. Pruning after the copy would only add whiteouts.
 
 | Trigger | Effect |
 |---|---|
-| Pinned CUDA base digest moves (weekly check) | Builds, then records the new digests in `.github/cuda-base` |
-| New stable release of `weicj/vLLM-2080Ti-Definitive` | Opens a pull request bumping `.github/vllm-ref`; merging it builds |
+| Pinned CUDA base digest moves (scheduled check) | Builds, then records the new digests in `.github/cuda-base` |
+| New stable release on the same release line (`v0.2.2` → `v0.2.2-post2`) | Builds, tags the image with that ref, then records it in `.github/vllm-ref` |
+| New stable release on a new minor/major line (`v0.2.x` → `v0.3.0`) | Opens a pull request bumping `.github/vllm-ref`; merging it builds |
 | `Dockerfile` / `entrypoint.sh` / pin files change | Builds |
 | `workflow_dispatch` | Always builds |
 | Pull request | Validation only: `shellcheck` + `docker build --target toolchain` |
 
-A new upstream vLLM release goes through review because it changes runtime
-behaviour. Note that **profile filenames have changed between upstream
-releases** (`dflash2-fp8kv-1x256k-…` at v0.2.1 vs `dflash2-fp8kv-1x262K-…` at
-v0.2.2); a stale name makes the launcher silently fall back to defaults.
+`.github/vllm-ref` is the **recorded last-built upstream release**, not a
+hand-maintained gate: the workflow writes it back after a successful push, so
+the scheduled check is idempotent (no new release, no build). Each image is
+pushed as `:latest`, as an immutable per-release tag (`v0.2.2-post2`), and as a
+`sha-<commit>` tag, and carries the upstream ref in the
+`io.github.zlwu.upstream-ref` label — so a running container can be traced back
+to the upstream tag without reading the Actions log.
+
+Same-line releases build automatically because that is where correctness fixes
+land (and the upstream maintainer validates them on SM75 before tagging). A
+release on a new line is a runtime migration — profiles, KV sizing and the
+model contract all move — so it still goes through review. Deployment is a
+separate, manual step either way: check the release notes for **profile
+filenames** (`dflash2-fp8kv-1x256k-…` at v0.2.1 vs `dflash2-fp8kv-1x262K-…` at
+v0.2.2; a stale name makes the launcher silently fall back to defaults) and for
+KV-pool/concurrency changes, and note that a new upstream ref invalidates the
+compiled caches under `/data/.../{triton,torchinductor}-cache` and
+`vllm-cache`.
 
 ## Usage
 
